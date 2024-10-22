@@ -645,7 +645,7 @@ class MyNet(ME.MinkowskiNetwork):
 
 
 class MyTestNet(ME.MinkowskiNetwork):
-    def __init__(self, in_channels=3, out_channels=32, D=3):
+    def __init__(self, in_channels=3, out_channels=3, D=3):
         ME.MinkowskiNetwork.__init__(self, D)
 
         self.conv1 = ME.MinkowskiConvolution(
@@ -727,8 +727,12 @@ if __name__ == '__main__':
     # -----------------------------run train test -------------------------------
     # -----------------------------要去服务器执行，本地Windows没装ME -------------------------------
     def position_loss(pred, target):
-        """计算位置增强任务的 MSE 损失"""
-        return torch.nn.functional.mse_loss(pred.F, target.F)
+        if isinstance(pred, ME.SparseTensor) and isinstance(target, ME.SparseTensor):
+            # 使用稀疏张量的密集特征进行损失计算
+            return torch.nn.functional.mse_loss(pred.F, target.F)
+        else:
+            # 假设 pred 和 target 都是普通张量
+            return torch.nn.functional.mse_loss(pred, target)
 
 
     def train_model(model, data_loader, optimizer, device='cuda', epochs=10, blocks_per_epoch=2):
@@ -747,23 +751,28 @@ if __name__ == '__main__':
                 if len(block_buffer_A) >= blocks_per_epoch:
                     # 每N个块进行处理
                     for i in range(0, len(block_buffer_A), blocks_per_epoch):
-                        print(block_buffer_A[i].shape,block_buffer_B[i].shape)
+                        if i + 1 >= len(block_buffer_A) or i + 1 >= len(block_buffer_B):
+                            print(f"Skipping block {i + 1} as it exceeds buffer length.")
+                            break
+
+                        print(block_buffer_A[i].shape, block_buffer_B[i].shape)
+
+                        # 提取坐标和特征
                         coords_A1, feats_A1 = block_buffer_A[i][0, :, :3], block_buffer_A[i][0, :, 3:]
                         coords_A2, feats_A2 = block_buffer_A[i + 1][0, :, :3], block_buffer_A[i + 1][0, :, 3:]
                         coords_B1, feats_B1 = block_buffer_B[i][0, :, :3], block_buffer_B[i][0, :, 3:]
                         coords_B2, feats_B2 = block_buffer_B[i + 1][0, :, :3], block_buffer_B[i + 1][0, :, 3:]
-                        # ([1, 13824, 3])
-                        print('coords_A1_shape:',coords_A1.shape, coords_A2.shape, coords_B1.shape, coords_B2.shape)
 
-                        coords_A_tensor = ME_utils.batched_coordinates(
-                            [coords_A1.view(-1, 3), coords_A2.view(-1, 3)], device=device
-                        )
-                        feats_A_tensor = torch.cat([feats_A1, feats_A2]).to(device)
+                        print('coords_A1_shape:', coords_A1.shape, coords_A2.shape, coords_B1.shape, coords_B2.shape)
 
-                        coords_B_tensor = ME_utils.batched_coordinates(
-                            [coords_B1.view(-1, 3), coords_B2.view(-1, 3)], device=device
-                        )
-                        feats_B_tensor = torch.cat([feats_B1, feats_B2]).to(device)
+                        # 合并坐标和特征
+                        coords_A_tensor = ME_utils.batched_coordinates([coords_A1.view(-1, 3), coords_A2.view(-1, 3)],
+                                                                       device=device)
+                        feats_A_tensor = torch.cat([feats_A1, feats_A2]).to(device).float()
+
+                        coords_B_tensor = ME_utils.batched_coordinates([coords_B1.view(-1, 3), coords_B2.view(-1, 3)],
+                                                                       device=device)
+                        feats_B_tensor = torch.cat([feats_B1, feats_B2]).to(device).float()
 
                         print('coords_AB_tensor_shape:', coords_A_tensor.shape, coords_B_tensor.shape)
                         print('feats_AB_tensor_shape:', feats_A_tensor.shape, feats_B_tensor.shape)
@@ -771,38 +780,35 @@ if __name__ == '__main__':
                         # 确保行数一致
                         assert feats_B_tensor.shape[0] == coords_B_tensor.shape[
                             0], "Feature and coordinates row count must match!"
-
-                        # 构造SparseTensor
-                        print(f"MODEL INPUT CHECK feats_B_tensor shape: {feats_B_tensor.shape}")
-                        print(f"coords_B_tensor shape: {coords_B_tensor.shape}")
-                        print(has_duplicates(feats_B_tensor))
-                        print(has_duplicates(coords_B_tensor))
-
-
-
-                        # 确保行数一致
                         assert feats_A_tensor.shape[0] == coords_A_tensor.shape[
                             0], "Feature and coordinates row count must match!"
 
                         origin = ME.SparseTensor(features=feats_A_tensor, coordinates=coords_A_tensor)
-                        print('model_origin_shape:',origin.shape)
+                        print('model_origin_shape:', origin.shape)
 
-
-                        # 压缩后的数据重复导致x.shape减少
+                        # 构造 SparseTensor
                         x = ME.SparseTensor(features=feats_B_tensor, coordinates=coords_B_tensor)
-                        print('model_input_x_shape:',x.shape,type(x))
-                        new_x = pad_sparse_tensor(x,origin)
-                        print('after pad model_input_x_shape:',new_x.shape,type(new_x))
+                        print('model_input_x_shape:', x.shape, type(x))
+
+                        new_x = pad_sparse_tensor(x, origin)
+                        print('after pad model_input_x_shape:', new_x.shape, type(new_x))
+
+                        # 确保 new_x 是 float32 类型
+                        new_x = ME.SparseTensor(
+                            features=new_x.F.float(),
+                            coordinates=new_x.C,
+                            coordinate_manager=new_x.coordinate_manager
+                        )
 
                         optimizer.zero_grad()
                         output = model(new_x)
 
-                        # 计算残差
-                        residual = output.F - feats_B_tensor
+                        # 计算残差并合并输出
+                        residual = output.F.float() - feats_B_tensor.float()
                         combined_output = output.F + residual
 
                         # 计算损失
-                        loss = position_loss(combined_output, origin)
+                        loss = position_loss(combined_output.float(), origin.F.float())
                         total_loss += loss.item()
 
                         loss.backward()
@@ -816,71 +822,16 @@ if __name__ == '__main__':
                     block_buffer_B.clear()
                     total_loss = 0
                     num_batches += 1
+            # 保存模型权重
+            save_path = str(epoch) + '_model.pth'
+            torch.save(model.state_dict(), save_path)
+            print(f"Model saved at epoch {epoch + 1} to {save_path}")
 
+    # model = MyNet()
 
-    # 初始化模型和优化器
     model = MyTestNet()
     model = model.float()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
     # 训练模型
     train_model(model, data_loader, optimizer)
-
-    # ----------------------------display ply-1 ---------------------------------
-
-
-    # # 批量处理合并后的大块数据
-    # for (coords_A, feats_A), (coords_B, feats_B) in data_loader:
-    #     print(f"A 文件点数量: {len(coords_A)}, B 文件点数量: {len(coords_B)}")
-    #     print(coords_A[0].shape)
-    #     # 在每个批次中处理所有块
-    #     for i in range(len(coords_A)):
-    #         # 这里处理每个块而不是每四个
-    #         coords = coords_A[i].numpy().astype(np.float64)[:, :3]  # 第四列是batch
-    #         feats = feats_A[i].numpy().astype(np.float64)
-    #
-    #         print(f"coords shape: {coords.shape}, feats shape: {feats.shape}")
-    #
-    #         # 显示 A 或 B 的某个块
-    #         display_point_cloud(coords, feats)
-
-    # ----------------------------display block-1 ---------------------------------
-
-    # # 想看每个小块用下面的
-    # for idx, (chunks_A, chunks_B) in enumerate(data_loader):
-    #     # 遍历每对文件的所有块
-    #     for i, (coords_A, feats_A) in enumerate(chunks_A):
-    #         print(f"A 文件的第 {i} 个块点数量: {len(coords_A)}")
-    #         display_point_cloud(coords_A, feats_A)
-    #         break
-
-    # ----------------------------save---------------------------------
-    # 创建保存文件夹
-    # os.makedirs("output_chunks", exist_ok=True)
-    #
-    # # 遍历每对数据，并将每个小块保存为单独的 PLY 文件
-    # for idx, (chunks_A, _) in enumerate(data_loader):
-    #     # chunks_A 是一个包含多个块的元组
-    #     print(f"第 {idx} 对文件的块信息类型: {type(chunks_A)}, 内容: {chunks_A}")
-    #
-    #     # 遍历每个小块
-    #     for chunk_idx in range(chunks_A[0].size(0)):  # 获取块的数量
-    #         coords = chunks_A[0][chunk_idx]  # 获取第 chunk_idx 个块的坐标
-    #         feats = chunks_A[1][chunk_idx]  # 获取第 chunk_idx 个块的特征
-    #
-    #         coords_np = coords.cpu().numpy() if isinstance(coords, torch.Tensor) else coords
-    #         feats_np = feats.cpu().numpy() if isinstance(feats, torch.Tensor) else feats
-    #
-    #         # 检查每个块的形状
-    #         print(f"块 {chunk_idx} 坐标形状: {coords_np.shape}, 特征形状: {feats_np.shape}")
-    #
-    #         # 提取前三列作为坐标，提取后面三列作为特征
-    #         coords_np = coords_np[:, :3]  # 只取坐标
-    #         feats_np = feats_np[:, :3]  # 只取特征
-    #
-    #         # 保存每一块到单独的 PLY 文件
-    #         filename = f"output_chunks/chunk_{idx}_{chunk_idx}.ply"
-    #         save_point_cloud_as_ply(coords_np, feats_np, filename)
-    #
-    #         print(f"保存文件: {filename}，坐标数量: {len(coords_np)}")
-    #
