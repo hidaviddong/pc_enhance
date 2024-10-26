@@ -11,6 +11,7 @@ from MinkowskiEngine import utils as ME_utils
 from scipy.spatial import KDTree
 import pandas as pd
 
+    
 def remove_duplicates(points):
     """
     去除点云数据中的重复点。
@@ -528,3 +529,93 @@ if __name__ == '__main__':
 
     # 训练模型
     train_model(model, data_loader, optimizer)
+    
+    def evaluate_and_save(model_path, dataset, output_dir='./output'):
+        """
+        加载模型，处理点云数据并保存结果
+
+        参数:
+        model_path: 训练好的模型路径（.pth文件）
+        dataset: 数据集
+        output_dir: 输出文件夹路径
+        """
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
+        # 加载模型
+        model = MyNet()
+        model.load_state_dict(torch.load(model_path))
+        model = model.to('cuda')
+        model.eval()
+
+        # 创建数据加载器
+        data_loader = DataLoader(dataset, batch_size=4)
+
+        with torch.no_grad():
+            for batch_idx, (chunks_original, chunks_compress) in enumerate(data_loader):
+                print(f"\n处理第 {batch_idx + 1} 个点云")
+
+                # 处理每个块
+                for block_idx in range(len(chunks_original[0])):
+                    print(f"\n处理块 {block_idx}")
+
+                    # 保存原始点云
+                    original_coords = chunks_original[0][block_idx][:, :3]
+                    original_feats = chunks_original[0][block_idx][:, 3:]
+                    save_point_cloud_as_ply(
+                        original_coords, 
+                        original_feats,
+                        f"{output_dir}/original_batch_{batch_idx}_block_{block_idx}.ply"
+                    )
+                    print(f"已保存原始点云")
+
+                    # 保存压缩点云
+                    compress_coords = chunks_compress[0][block_idx][:, :3]
+                    compress_feats = chunks_compress[0][block_idx][:, 3:]
+                    save_point_cloud_as_ply(
+                        compress_coords, 
+                        compress_feats,
+                        f"{output_dir}/compressed_batch_{batch_idx}_block_{block_idx}.ply"
+                    )
+                    print(f"已保存压缩点云")
+
+                    # 处理压缩点云
+                    coords_compress_tensor = ME_utils.batched_coordinates([compress_coords], device='cuda')
+                    feats_compress_tensor = compress_feats.to('cuda').float()
+
+                    # 创建稀疏张量
+                    compress_sparse_tensor = ME.SparseTensor(
+                        features=feats_compress_tensor,
+                        coordinates=coords_compress_tensor
+                    )
+
+                    # 模型预测
+                    output = model(compress_sparse_tensor)
+
+                    # 获取预测结果
+                    pred_coords = output.C[:, 1:].cpu().numpy()  # 去掉批次维度
+                    pred_feats = output.F.cpu().numpy()
+
+                    # 保存处理后的结果
+                    save_point_cloud_as_ply(
+                        pred_coords, 
+                        pred_feats,
+                        f"{output_dir}/result_batch_{batch_idx}_block_{block_idx}.ply"
+                    )
+                    print(f"已保存处理后的结果")
+
+                    # 打印点数信息便于对比
+                    print(f"原始点云点数: {len(original_coords)}")
+                    print(f"压缩点云点数: {len(compress_coords)}")
+                    print(f"处理后点数: {len(pred_coords)}")
+
+
+
+    # 评估部分
+#     print("\n开始评估...")
+#     evaluate_and_save(
+#         model_path='epoch_10_model.pth',  # 使用最后一个epoch的模型
+#         dataset=dataset
+#     )
+#     print("评估完成！请查看 output 文件夹中的结果")
+    
