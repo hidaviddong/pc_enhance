@@ -160,9 +160,58 @@ def adjust_points(points, target_num_points, perturbation_scale=0.01):
     else:
         indices = np.random.choice(current_num_points, target_num_points, replace=False)
         return points[indices]
+    
+def find_corresponding_original_points(compressed_points, original_points):
+    """
+    為壓縮點雲中的每個點找到原始點雲中未被使用的最近點
+    
+    參數:
+    compressed_points: 壓縮後的點雲數據 (N, D)
+    original_points: 原始點雲數據 (M, D)
+    
+    返回:
+    numpy.ndarray: 與壓縮點雲相同shape的矩陣，包含來自原始點雲的未重複點
+    """
+    tree = KDTree(original_points)
+    result = np.zeros_like(compressed_points)
+    used_original_indices = set()  # 追踪已使用的原始點的索引
+    
+    print(f"壓縮點雲shape: {compressed_points.shape}")
+    print(f"原始點雲shape: {original_points.shape}")
+    
+    # 為每個壓縮點找對應的原始點
+    for i, comp_point in enumerate(compressed_points):
+        # 查詢足夠多的近鄰點
+        k = min(10000, len(original_points))  # 可以根據需要調整 k 的值
+        distances, indices = tree.query(comp_point, k=k)
+        
+        # 找到第一個未使用的點
+        found = False
+        for idx in indices:
+            if idx not in used_original_indices:
+                result[i] = original_points[idx]
+                used_original_indices.add(idx)
+                found = True
+                break
+                
+        if not found:
+            print(f"警告：點 {i} 無法找到未使用的對應點")
+            # 這裡可以根據需求決定如何處理找不到未使用點的情況
+            # 比如使用距離最近的點，或者拋出異常
+        
+        # 打印進度
+        if (i + 1) % 1000 == 0:
+            print(f"已處理: {i + 1}/{len(compressed_points)} 點")
+    
+    # 驗證結果
+    unique_points = set(map(tuple, result))
+    print(f"結果點數: {len(result)}")
+    print(f"唯一點數: {len(unique_points)}")
+    
+    return result
 
 class PointCloudDataset(Dataset):
-    def __init__(self, folder_A, folder_B, num_blocks=10):
+    def __init__(self, folder_A, folder_B, num_blocks=20):
         """
         初始化数据集
         :param folder_A: 原始点云文件夹路径
@@ -213,7 +262,7 @@ class PointCloudDataset(Dataset):
 
         return matched_files
 
-    def split_points_by_coordinate(self, points, num_blocks=10):
+    def split_points_by_coordinate(self, points, num_blocks=20):
         """
         按最长维度分割点云
         :param points: 点云数据 (N, 6)
@@ -282,35 +331,7 @@ class PointCloudDataset(Dataset):
             print("\n开始分割压缩点云...")
             chunks_B = self.split_points_by_coordinate(points_B, self.num_blocks)
             
-            # 调整点数使其匹配
-            adjusted_chunks_A = []
-            adjusted_chunks_B = []
-            
-            print("\n开始调整块的点数...")
-            for i, (chunk_A, chunk_B) in enumerate(zip(chunks_A, chunks_B)):
-                print(f"\n处理第 {i} 块:")
-                print(f"原始块点数: {len(chunk_A)}, 压缩块点数: {len(chunk_B)}")
-                
-                adjusted_chunk_B = adjust_points(chunk_B, len(chunk_A))
-                print(f"调整后的压缩块点数: {len(adjusted_chunk_B)}")
-                
-                adjusted_chunks_A.append(chunk_A)
-                adjusted_chunks_B.append(adjusted_chunk_B)
-            
-            print(f"\n处理完成，共生成 {len(adjusted_chunks_A)} 对匹配块")
-            
-            # 验证块数量是否匹配
-            if len(adjusted_chunks_A) != len(adjusted_chunks_B):
-                print(f"警告：块数不匹配! A: {len(adjusted_chunks_A)}, B: {len(adjusted_chunks_B)}")
-                return None
-                
-            # 验证每个块的点数是否匹配
-            for i, (chunk_A, chunk_B) in enumerate(zip(adjusted_chunks_A, adjusted_chunks_B)):
-                if len(chunk_A) != len(chunk_B):
-                    print(f"警告：第 {i} 块的点数不匹配! A: {len(chunk_A)}, B: {len(chunk_B)}")
-                    return None
-            
-            return (adjusted_chunks_A, adjusted_chunks_B)
+            return (chunks_A, chunks_B)
             
         except Exception as e:
             print(f"处理文件时发生错误: {str(e)}")
@@ -369,66 +390,14 @@ class MyNet(ME.MinkowskiNetwork):
         out = self.relu1(out)
         return out
 
-def pad_sparse_tensor(x, origin):
-    """
-    给稀疏张量 x 添加数据，使其形状与 origin 保持一致。
-
-    参数:
-    x (ME.SparseTensor): 需要填补的稀疏张量。
-    origin (ME.SparseTensor): 参考的稀疏张量，其形状为目标形状。
-
-    返回:
-    ME.SparseTensor: 填补后的稀疏张量 x。
-    """
-    # 获取需要填补的数量
-    num_to_add = origin.shape[0] - x.shape[0]
-
-    if num_to_add <= 0:
-        return x  # 如果 x 的形状已经大于或等于 origin，则不需要填补
-
-    # 获取 x 的设备
-    device = x.F.device
-
-    # 生成随机特征
-    random_feats = torch.randn(num_to_add, x.F.shape[1], device=device)
-
-    # 生成唯一的随机坐标
-    existing_coords = set(tuple(coord.tolist()) for coord in x.C)
-    random_coords = []
-    while len(random_coords) < num_to_add:
-        coord = torch.randint(0, 100, (x.C.shape[1],), device=device, dtype=torch.float32).tolist()
-        if tuple(coord) not in existing_coords:
-            random_coords.append(coord)
-            existing_coords.add(tuple(coord))
-
-    random_coords = torch.tensor(random_coords, device=device, dtype=torch.float32).int()
-
-    # 将原始数据和随机数据拼接
-    new_feats = torch.cat([x.F, random_feats], dim=0)
-    new_coords = torch.cat([x.C, random_coords], dim=0)
-
-    # 创建新的稀疏张量
-    new_x = ME.SparseTensor(features=new_feats, coordinates=new_coords, coordinate_manager=x.coordinate_manager)
-
-    # 调试信息
-    print(f'Original shape: {x.shape}')
-    print(f'Origin shape: {origin.shape}')
-    print(f'New shape: {new_x.shape}')
-    print(f'Number of features added: {num_to_add}')
-
-    return new_x
-
 if __name__ == '__main__':
     dataset = PointCloudDataset(folder_A='./data/original',
                                 folder_B='./data/compress',
-                                num_blocks = 15
+                                num_blocks = 50
                                 )
-    # TODO: use batch_size = 4 or 8
     data_loader = DataLoader(dataset, batch_size=1)
 
 
-    # -----------------------------run train test -------------------------------
-    # -----------------------------要去服务器执行，本地Windows没装ME -------------------------------
     def position_loss(pred, target):
         if isinstance(pred, ME.SparseTensor) and isinstance(target, ME.SparseTensor):
             # 使用稀疏张量的密集特征进行损失计算
@@ -438,98 +407,118 @@ if __name__ == '__main__':
             return torch.nn.functional.mse_loss(pred, target)
 
 
-    def train_model(model, data_loader, optimizer, device='cuda', epochs=10, blocks_per_epoch=2):
+    def train_model(model, data_loader, optimizer, device='cuda', epochs=10):
         model = model.to(device)
         model.train()
 
         for epoch in range(epochs):
             total_loss = 0
             num_batches = 0
-            block_buffer_A, block_buffer_B = [], []
 
-            for (chunks_A, chunks_B) in data_loader:
-                block_buffer_A.extend(chunks_A)
-                block_buffer_B.extend(chunks_B)
+            for batch_idx, (chunks_original, chunks_compress) in enumerate(data_loader):
+                # 遍历每一对块
+                for block_idx in range(len(chunks_original[0])):
+                    # 获取当前块的数据
+                    coords_original = chunks_original[0][block_idx][:, :3]  # [N, 3] 坐标
+                    feats_original = chunks_original[0][block_idx][:, 3:]   # [N, 3] 特征(RGB)
+                    coords_compress = chunks_compress[0][block_idx][:, :3]  # [N, 3] 坐标
+                    feats_compress = chunks_compress[0][block_idx][:, 3:]   # [N, 3] 特征(RGB)
 
-                if len(block_buffer_A) >= blocks_per_epoch:
-                    # 每N个块进行处理
-                    for i in range(0, len(block_buffer_A), blocks_per_epoch):
-                        if i + 1 >= len(block_buffer_A) or i + 1 >= len(block_buffer_B):
-                            print(f"Skipping block {i + 1} as it exceeds buffer length.")
-                            break
+                    print(f'\nProcessing block {block_idx}:')
+                    print(f'Original points: {coords_original.shape[0]}, Compressed points: {coords_compress.shape[0]}')
 
-                        print(block_buffer_A[i].shape, block_buffer_B[i].shape)
+                    # 转换为ME需要的格式
+                    coords_original_tensor = ME_utils.batched_coordinates([coords_original.view(-1, 3)], device=device)
+                    coords_compress_tensor = ME_utils.batched_coordinates([coords_compress.view(-1, 3)], device=device)
+                    feats_original_tensor = feats_original.to(device).float()
+                    feats_compress_tensor = feats_compress.to(device).float()
+                 
+                    assert feats_compress_tensor.shape[0] == coords_compress_tensor.shape[0], "Feature and coordinates row count must match!"
+                    assert feats_original_tensor.shape[0] == coords_original_tensor.shape[0], "Feature and coordinates row count must match!"
 
-                        # 提取坐标和特征
-                        coords_A1, feats_A1 = block_buffer_A[i][0, :, :3], block_buffer_A[i][0, :, 3:]
-                        coords_A2, feats_A2 = block_buffer_A[i + 1][0, :, :3], block_buffer_A[i + 1][0, :, 3:]
-                        coords_B1, feats_B1 = block_buffer_B[i][0, :, :3], block_buffer_B[i][0, :, 3:]
-                        coords_B2, feats_B2 = block_buffer_B[i + 1][0, :, :3], block_buffer_B[i + 1][0, :, 3:]
+                    # 构建稀疏张量
+                    original_sparse_tensor = ME.SparseTensor(features=feats_original_tensor, coordinates=coords_original_tensor)
+                    compress_sparse_tensor = ME.SparseTensor(features=feats_compress_tensor, coordinates=coords_compress_tensor)
 
-                        print('coords_A1_shape:', coords_A1.shape, coords_A2.shape, coords_B1.shape, coords_B2.shape)
+                    print('Input shapes:')
+                    print(f'Origin: {original_sparse_tensor.shape}')
+                    print(f'Input x: {compress_sparse_tensor.shape}') #ME 会压缩让点数变少，因为VPCC 后的 点云有重复的。
+                    
+                    coords_compress_dedup = compress_sparse_tensor.C[:, 1:].cpu().numpy()  # 去掉批次维度并转为numpy
+                    coords_original_numpy = coords_original.cpu().numpy() if torch.is_tensor(coords_original) else coords_original
+             
+                    coords_new_original = find_corresponding_original_points(coords_compress_dedup, coords_original_numpy)
+                
+                    coords_new_original = torch.from_numpy(coords_new_original).float()
+                    coords_new_original_tensor = ME_utils.batched_coordinates([coords_new_original], device=device)
+                    print("coords_new_original",coords_new_original)
+                    print("coords_new_original_tensor",coords_new_original_tensor.shape)
+                    
+                    def generate_corresponding_features(coords_new_original, coords_original, feats_original):
+                        # 确保所有输入都是 numpy 数组
+                        if torch.is_tensor(coords_new_original):
+                            coords_new_original = coords_new_original.cpu().numpy()
+                        if torch.is_tensor(coords_original):
+                            coords_original = coords_original.cpu().numpy()
+                        if torch.is_tensor(feats_original):
+                            feats_original = feats_original.cpu().numpy()
 
-                        # 合并坐标和特征
-                        coords_A_tensor = ME_utils.batched_coordinates([coords_A1.view(-1, 3), coords_A2.view(-1, 3)],
-                                                                       device=device)
-                        feats_A_tensor = torch.cat([feats_A1, feats_A2]).to(device).float()
+                        # 创建新的特征数组
+                        feats_new = np.zeros((len(coords_new_original), feats_original.shape[1]))
 
-                        coords_B_tensor = ME_utils.batched_coordinates([coords_B1.view(-1, 3), coords_B2.view(-1, 3)],
-                                                                       device=device)
-                        feats_B_tensor = torch.cat([feats_B1, feats_B2]).to(device).float()
+                        # 遍历每个新坐标点
+                        for i, target_point in enumerate(coords_new_original):
+                            # 现在 target_point 和 search_points 都是 numpy array，可以正确计算距离
+                            distances = np.linalg.norm(coords_original - target_point, axis=1)
+                            nearest_idx = np.argmin(distances)
+                            feats_new[i] = feats_original[nearest_idx]
 
-                        print('coords_AB_tensor_shape:', coords_A_tensor.shape, coords_B_tensor.shape)
-                        print('feats_AB_tensor_shape:', feats_A_tensor.shape, feats_B_tensor.shape)
+                            if (i + 1) % 1000 == 0:
+                                print(f"已处理: {i + 1}/{len(coords_new_original)} 点")
 
-                        # 确保行数一致
-                        assert feats_B_tensor.shape[0] == coords_B_tensor.shape[
-                            0], "Feature and coordinates row count must match!"
-                        assert feats_A_tensor.shape[0] == coords_A_tensor.shape[
-                            0], "Feature and coordinates row count must match!"
-                        
-                        # TODO: use kd-tree,create a new_origin variables
+                        # 转换为tensor并移到指定设备
+                        feats_new_original_tensor = torch.tensor(feats_new, device=device).float()
 
-                        origin = ME.SparseTensor(features=feats_A_tensor, coordinates=coords_A_tensor)
-                        print('model_origin_shape:', origin.shape)
+                        return feats_new_original_tensor
 
-                        # 构造 SparseTensor
-                        x = ME.SparseTensor(features=feats_B_tensor, coordinates=coords_B_tensor)
-                        print('model_input_x_shape:', x.shape, type(x))
 
-                        # TODO: we don't need pad_sparse_tensor
-                        new_x = pad_sparse_tensor(x, origin)
-                        print('after pad model_input_x_shape:', new_x.shape, type(new_x))
+                    feats_new_original_tensor = generate_corresponding_features(
+                        coords_new_original,
+                        coords_original,
+                        feats_original
+                    )
+                    print("feats_new_original_tensor",feats_new_original_tensor.shape) # [18645,3]
+                    
+                    new_original_sparse_tensor = ME.SparseTensor(features=feats_new_original_tensor, coordinates=coords_new_original_tensor)
+                    
+                    print("new_original_sparse_tensor",new_original_sparse_tensor.shape) # [18645,3]
+                   
+                    # 前向传播和优化
+                    optimizer.zero_grad()
+                    output = model(compress_sparse_tensor)
+                    print("Shapes before residual calculation:")
+                    print("output.F shape:", output.F.shape)
+                    print("feats_compress_tensor shape:", feats_compress_tensor.shape)
+                    print("compress_sparse_tensor.F shape:", compress_sparse_tensor.F.shape)
+                    print("new_original_sparse_tensor.F shape:", new_original_sparse_tensor.F.shape)
 
-                        # 确保 new_x 是 float32 类型
-                        new_x = ME.SparseTensor(
-                            features=new_x.F.float(),
-                            coordinates=new_x.C,
-                            coordinate_manager=new_x.coordinate_manager
-                        )
+                    # 计算损失
+                    loss = position_loss(output.F.float(), new_original_sparse_tensor.F.float())
+                    total_loss += loss.item()
 
-                        optimizer.zero_grad()
-                        output = model(new_x)
+                    # 反向传播
+                    loss.backward()
+                    optimizer.step()
 
-                        # 计算残差并合并输出
-                        residual = output.F.float() - feats_B_tensor.float()
-                        combined_output = output.F + residual
-
-                        # 计算损失
-                        loss = position_loss(combined_output.float(), origin.F.float())
-                        total_loss += loss.item()
-
-                        loss.backward()
-                        optimizer.step()
-
-                    avg_loss = total_loss / (blocks_per_epoch // 2)
-                    print(f"Epoch {epoch + 1}/{epochs}, Batch {num_batches + 1}, Average Loss: {avg_loss:.4f}")
-
-                    # 清空缓冲区
-                    block_buffer_A.clear()
-                    block_buffer_B.clear()
-                    total_loss = 0
                     num_batches += 1
+                    print(f'Block {block_idx} Loss: {loss.item():.4f}')
+
+            # 每个epoch结束后打印平均损失
+            avg_loss = total_loss / num_batches
+            print(f'\nEpoch {epoch + 1}/{epochs}, Average Loss: {avg_loss:.4f}')
+
             # 保存模型权重
-            save_path = str(epoch) + '_model.pth'
+            save_path = f'epoch_{epoch + 1}_model.pth'
             torch.save(model.state_dict(), save_path)
             print(f"Model saved at epoch {epoch + 1} to {save_path}")
 
