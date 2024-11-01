@@ -455,10 +455,10 @@ def save_point_cloud_as_ply(coords, feats, filename):
     """
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(coords)
-    pcd.colors = o3d.utility.Vector3dVector(feats / 255.0)  # 归一化颜色
+    pcd.colors = o3d.utility.Vector3dVector(feats)
 
     # 保存为 PLY 文件
-    o3d.io.write_point_cloud(filename, pcd)
+    o3d.io.write_point_cloud(filename, pcd, write_ascii=True)
     logger.info(f"保存成功: {filename}")
 
 
@@ -466,24 +466,62 @@ def save_point_cloud_as_ply(coords, feats, filename):
 class MyNet(ME.MinkowskiNetwork):
     def __init__(self, in_channels=3, out_channels=3, D=3):
         ME.MinkowskiNetwork.__init__(self, D)
-
+        
+        # 编码器第一层
         self.conv1 = ME.MinkowskiConvolution(
             in_channels=in_channels,
-            out_channels=out_channels,
+            out_channels=32,
             kernel_size=3,
             stride=1,
-            dilation=1,
-            bias=False,
-            dimension=D
-        )
-        self.norm1 = ME.MinkowskiBatchNorm(out_channels)
-        self.relu1 = ME.MinkowskiReLU()
+            dimension=D)
+        self.norm1 = ME.MinkowskiBatchNorm(32)
+        
+        # 编码器第二层
+        self.conv2 = ME.MinkowskiConvolution(
+            in_channels=32,
+            out_channels=64,
+            kernel_size=3,
+            stride=2,
+            dimension=D)
+        self.norm2 = ME.MinkowskiBatchNorm(64)
+        
+        # 解码器层
+        self.conv2_tr = ME.MinkowskiConvolutionTranspose(
+            in_channels=64,
+            out_channels=32,
+            kernel_size=3,
+            stride=2,
+            dimension=D)
+        self.norm2_tr = ME.MinkowskiBatchNorm(32)
+        
+        # 最终输出层
+        self.final = ME.MinkowskiConvolution(
+            in_channels=32,
+            out_channels=out_channels,
+            kernel_size=1,
+            stride=1,
+            dimension=D)
 
     def forward(self, x):
-        out = self.conv1(x)
-        out = self.norm1(out)
-        out = self.relu1(out)
+        # 编码器路径
+        out1 = self.norm1(self.conv1(x))
+        out1 = MEF.relu(out1)
+        
+        out2 = self.norm2(self.conv2(out1))
+        out2 = MEF.relu(out2)
+        
+        # 解码器路径
+        out = self.norm2_tr(self.conv2_tr(out2))
+        out = MEF.relu(out)
+        
+        # skip connection
+        out = out + out1
+        
+        # 最终输出
+        out = self.final(out)
+        
         return out
+
 
 if __name__ == '__main__':
     dataset = PointCloudDataset(folder_A='./train/original',
@@ -494,15 +532,42 @@ if __name__ == '__main__':
     test_dataset = PointCloudDataset(folder_A='./test/original',folder_B='./test/compress',num_blocks = 50)
 
     def position_loss(pred, target):
+        """
+        改进的位置损失函数，包含归一化处理
+        """
         if isinstance(pred, ME.SparseTensor) and isinstance(target, ME.SparseTensor):
-            # 使用稀疏张量的密集特征进行损失计算
-            return torch.nn.functional.mse_loss(pred.F, target.F)
-        else:
-            # 假设 pred 和 target 都是普通张量
-            return torch.nn.functional.mse_loss(pred, target)
+            pred = pred.F
+            target = target.F
 
+        # 对预测值和目标值进行归一化
+        pred_min, _ = pred.min(dim=0, keepdim=True)
+        pred_max, _ = pred.max(dim=0, keepdim=True)
+        target_min, _ = target.min(dim=0, keepdim=True)
+        target_max, _ = target.max(dim=0, keepdim=True)
 
-    def train_model(model, data_loader, optimizer, device='cuda', epochs=10):
+        # 使用相同的范围进行归一化
+        min_vals = torch.min(pred_min, target_min)
+        max_vals = torch.max(pred_max, target_max)
+
+        # 避免除以零
+        scale = max_vals - min_vals
+        scale[scale == 0] = 1.0
+
+        pred_normalized = (pred - min_vals) / scale
+        target_normalized = (target - min_vals) / scale
+
+        # 计算归一化后的MSE损失
+        loss = torch.nn.functional.mse_loss(pred_normalized, target_normalized)
+
+        # 添加调试信息
+        if torch.isnan(loss) or torch.isinf(loss):
+            logger.info(f"Warning: Loss is {loss}")
+            logger.info(f"Pred range: {pred.min().item():.4f} to {pred.max().item():.4f}")
+            logger.info(f"Target range: {target.min().item():.4f} to {target.max().item():.4f}")
+
+        return loss
+
+    def train_model(model, data_loader, optimizer, device='cuda', epochs=50):
         model = model.to(device)
         model.train()
 
@@ -521,83 +586,38 @@ if __name__ == '__main__':
                     for block_idx in range(len(chunks_original)):
                         # 获取当前块的数据
                         coords_original = chunks_original[block_idx][:, :3]  # [N, 3] 坐标
-                        feats_original = chunks_original[block_idx][:, 3:]   # [N, 3] 特征(RGB)
                         coords_compress = chunks_compress[block_idx][:, :3]  # [N, 3] 坐标
-                        feats_compress = chunks_compress[block_idx][:, 3:]   # [N, 3] 特征(RGB)
-
-                        logger.info(f'\nProcessing block {block_idx}:')
-                        logger.info(f'Original points: {coords_original.shape[0]}, Compressed points: {coords_compress.shape[0]}')
 
                         # 转换为torch.Tensor
                         coords_original = torch.from_numpy(coords_original).float()
-                        feats_original = torch.from_numpy(feats_original).float()
                         coords_compress = torch.from_numpy(coords_compress).float()
-                        feats_compress = torch.from_numpy(feats_compress).float()
 
                         # 转换为ME需要的格式
                         coords_original_tensor = ME_utils.batched_coordinates([coords_original], device=device)
                         coords_compress_tensor = ME_utils.batched_coordinates([coords_compress], device=device)
-                        feats_original_tensor = feats_original.to(device)
-                        feats_compress_tensor = feats_compress.to(device)
-
-                        assert feats_compress_tensor.shape[0] == coords_compress_tensor.shape[0], "Feature and coordinates row count must match!"
-                        assert feats_original_tensor.shape[0] == coords_original_tensor.shape[0], "Feature and coordinates row count must match!"
+                       
+                        coords_original_features = coords_original.to(device)
+                        coords_compress_features = coords_compress.to(device)
 
                         # 构建稀疏张量
-                        original_sparse_tensor = ME.SparseTensor(features=feats_original_tensor, coordinates=coords_original_tensor)
-                        compress_sparse_tensor = ME.SparseTensor(features=feats_compress_tensor, coordinates=coords_compress_tensor)
+                        original_sparse_tensor = ME.SparseTensor(features=coords_original_features, coordinates=coords_original_tensor)
+                        
+                        compress_sparse_tensor = ME.SparseTensor(features=coords_compress_features
+, coordinates=coords_compress_tensor)
 
-                        logger.info('Input shapes:')
                         logger.info(f'Origin: {original_sparse_tensor.shape}')
-                        logger.info(f'Input x: {compress_sparse_tensor.shape}')
-
+                        logger.info(f'Compress: {compress_sparse_tensor.shape}')
+                      
                         coords_compress_dedup = compress_sparse_tensor.C[:, 1:].cpu().numpy()  # 去掉批次维度并转为numpy
                         coords_original_numpy = coords_original.cpu().numpy()
 
                         coords_new_original = find_corresponding_original_points(coords_compress_dedup, coords_original_numpy)
-
                         coords_new_original = torch.from_numpy(coords_new_original).float()
+                        coords_new_original_features = coords_new_original.to(device)
                         coords_new_original_tensor = ME_utils.batched_coordinates([coords_new_original], device=device)
-                        logger.info("coords_new_original",coords_new_original)
-                        logger.info("coords_new_original_tensor",coords_new_original_tensor.shape)
-
-                        def generate_corresponding_features(coords_new_original, coords_original, feats_original):
-                            # 确保所有输入都是 numpy 数组
-                            if torch.is_tensor(coords_new_original):
-                                coords_new_original = coords_new_original.cpu().numpy()
-                            if torch.is_tensor(coords_original):
-                                coords_original = coords_original.cpu().numpy()
-                            if torch.is_tensor(feats_original):
-                                feats_original = feats_original.cpu().numpy()
-
-                            # 创建新的特征数组
-                            feats_new = np.zeros((len(coords_new_original), feats_original.shape[1]))
-
-                            # 遍历每个新坐标点
-                            for i, target_point in enumerate(coords_new_original):
-                                # 现在 target_point 和 search_points 都是 numpy array，可以正确计算距离
-                                distances = np.linalg.norm(coords_original - target_point, axis=1)
-                                nearest_idx = np.argmin(distances)
-                                feats_new[i] = feats_original[nearest_idx]
-
-                                if (i + 1) % 1000 == 0:
-                                    logger.info(f"已处理: {i + 1}/{len(coords_new_original)} 点")
-
-                            # 转换为tensor并移到指定设备
-                            feats_new_original_tensor = torch.tensor(feats_new, device=device).float()
-
-                            return feats_new_original_tensor
-                    
-                        feats_new_original_tensor = generate_corresponding_features(
-                            coords_new_original,
-                            coords_original,
-                            feats_original
-                        )
-                        logger.info("feats_new_original_tensor",feats_new_original_tensor.shape)
-
-                        new_original_sparse_tensor = ME.SparseTensor(features=feats_new_original_tensor, coordinates=coords_new_original_tensor)
-
-                        logger.info("new_original_sparse_tensor",new_original_sparse_tensor.shape)
+                        
+                        new_original_sparse_tensor = ME.SparseTensor(features=coords_new_original_features, coordinates=coords_new_original_tensor)
+                        logger.info(f"New Origin {new_original_sparse_tensor.shape}")
 
                         # 前向传播
                         output = model(compress_sparse_tensor)
@@ -636,113 +656,117 @@ if __name__ == '__main__':
     train_model(model, data_loader, optimizer)
     
     def evaluate_and_save(model_path, dataset, output_dir='./output'):
-        """
-        加载模型，处理点云数据并保存结果
-
-        参数:
-        model_path: 训练好的模型路径（.pth文件）
-        dataset: 数据集
-        output_dir: 输出文件夹路径
-        """
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
 
-        # 加载模型
         model = MyNet()
         model.load_state_dict(torch.load(model_path))
-        model = model.to('cuda')
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model.to(device)
         model.eval()
 
-        # 创建数据加载器
-        data_loader = DataLoader(dataset, batch_size=8,collate_fn=custom_collate_fn)
+        data_loader = DataLoader(dataset, batch_size=8, collate_fn=custom_collate_fn)
 
         with torch.no_grad():
             for batch_idx, (chunks_original, chunks_compress) in enumerate(data_loader):
                 logger.info(f"\n处理第 {batch_idx + 1} 个点云")
 
+                # 初始化存储所有block的数组
+                all_original_coords = []
+                all_original_feats = []
+                all_compress_coords = []
+                all_compress_feats = []
+                all_predicted_coords = []
+                all_predicted_feats = []
+
                 # 处理每个块
                 for block_idx in range(len(chunks_original[0])):
                     logger.info(f"\n处理块 {block_idx}")
 
-                    # 保存原始点云
-                    original_file = f"{output_dir}/original_batch_{batch_idx}_block_{block_idx}.ply"
+                    # 获取原始点云数据
                     original_coords = chunks_original[0][block_idx][:, :3]
                     original_feats = chunks_original[0][block_idx][:, 3:]
-                    save_point_cloud_as_ply(
-                        original_coords, 
-                        original_feats,
-                        original_file
-                    )
-                    logger.info(f"已保存原始点云")
-
-                    # 保存压缩点云
-                    compress_coords = chunks_compress[0][block_idx][:, :3]
-                    compress_feats = chunks_compress[0][block_idx][:, 3:]
-                    compressed_file = f"{output_dir}/compressed_batch_{batch_idx}_block_{block_idx}.ply"
-                    save_point_cloud_as_ply(
-                        compress_coords, 
-                        compress_feats,
-                        compressed_file
-                    )
-                    logger.info(f"已保存压缩点云")
+                    all_original_coords.append(original_coords)
+                    all_original_feats.append(original_feats)
 
                     # 处理压缩点云
-                    coords_compress_tensor = ME_utils.batched_coordinates([compress_coords], device='cuda')
-                    feats_compress_tensor = torch.from_numpy(compress_feats).to('cuda').float()
+                    compress_coords = chunks_compress[0][block_idx][:, :3]
+                    compress_feats = chunks_compress[0][block_idx][:, 3:]
+                    all_compress_coords.append(compress_coords)
+                    all_compress_feats.append(compress_feats)
 
-                    # 创建稀疏张量
+                    # 模型处理部分
+                    compress_coords_tensor = torch.from_numpy(compress_coords).float()
+                    compress_coords_tensor_batch = ME_utils.batched_coordinates([compress_coords_tensor], device=device)
+                    compress_coords_features = compress_coords_tensor.to(device)
                     compress_sparse_tensor = ME.SparseTensor(
-                        features=feats_compress_tensor,
-                        coordinates=coords_compress_tensor
+                        features=compress_coords_features,
+                        coordinates=compress_coords_tensor_batch
                     )
 
-                    # 模型预测
                     output = model(compress_sparse_tensor)
+                    output_coords = output.C[:, 1:].cpu().numpy()
 
-                    # 获取预测结果
-                    pred_coords = output.C[:, 1:].cpu().numpy()  # 去掉批次维度
-                    pred_feats = output.F.cpu().numpy()
+                    # 找到匹配的点
+                    matched_indices = []
+                    compress_coords_numpy = compress_coords
+                    for coord in output_coords:
+                        matches = np.where((compress_coords_numpy == coord).all(axis=1))[0]
+                        if len(matches) > 0:
+                            matched_indices.append(matches[0])
 
-                    # 保存处理后的结果
-                    result_file = f"{output_dir}/result_batch_{batch_idx}_block_{block_idx}.ply"
-                    save_point_cloud_as_ply(
-                        pred_coords, 
-                        pred_feats,
-                        f"{output_dir}/result_batch_{batch_idx}_block_{block_idx}.ply"
-                    )
-                    logger.info(f"已保存处理后的结果")
-                   
-                    # 计算压缩点云与原始点云的PSNR
-                    cmd1 = f"../../mpeg-pcc-tmc2/bin/PccAppMetrics --uncompressedDataPath={original_file} --reconstructedDataPath={compressed_file} --resolution=1023 --frameCount=1"
-                    logger.info("执行命令：" + cmd1)
-                    process1 = subprocess.Popen(cmd1, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    output1, error1 = process1.communicate()
+                    C_coords = compress_coords_numpy[matched_indices]
+                    C_feats = compress_feats[matched_indices]
 
-                    # 保存压缩点云PSNR结果
-                    psnr_file1 = f"{output_dir}/psnr_compressed_batch_{batch_idx}_block_{block_idx}.txt"
-                    with open(psnr_file1, 'w') as f:
-                        f.write(output1.decode())
-                    logger.info(f"压缩点云PSNR结果已保存到：{psnr_file1}")
+                    # 计算预测坐标
+                    predicted_offsets = output.F.cpu().numpy()
+                    predicted_coords = C_coords + predicted_offsets
 
-                    # 计算处理后结果与原始点云的PSNR
-                    cmd2 = f"../../mpeg-pcc-tmc2/bin/PccAppMetrics --uncompressedDataPath={original_file} --reconstructedDataPath={result_file} --resolution=1023 --frameCount=1"
-                    logger.info("执行命令：" + cmd2)
-                    process2 = subprocess.Popen(cmd2, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    output2, error2 = process2.communicate()
+                    all_predicted_coords.append(predicted_coords)
+                    all_predicted_feats.append(C_feats)
 
-                    # 保存处理结果PSNR结果
-                    psnr_file2 = f"{output_dir}/psnr_result_batch_{batch_idx}_block_{block_idx}.txt"
-                    with open(psnr_file2, 'w') as f:
-                        f.write(output2.decode())
-                    logger.info(f"处理结果PSNR已保存到：{psnr_file2}")
-                
-                    # 打印点数信息便于对比
-                    logger.info(f"原始点云点数: {len(original_coords)}")
-                    logger.info(f"压缩点云点数: {len(compress_coords)}")
-                    logger.info(f"处理后点数: {len(pred_coords)}")
-                    
+                # 合并所有block的点云
+                merged_original_coords = np.concatenate(all_original_coords, axis=0)
+                merged_original_feats = np.concatenate(all_original_feats, axis=0)
+                merged_compress_coords = np.concatenate(all_compress_coords, axis=0)
+                merged_compress_feats = np.concatenate(all_compress_feats, axis=0)
+                merged_predicted_coords = np.concatenate(all_predicted_coords, axis=0)
+                merged_predicted_feats = np.concatenate(all_predicted_feats, axis=0)
+
+                # 保存合并后的点云
+                original_file = f"{output_dir}/original_merged_batch_{batch_idx}.ply"
+                compressed_file = f"{output_dir}/compressed_merged_batch_{batch_idx}.ply"
+                result_file = f"{output_dir}/result_merged_batch_{batch_idx}.ply"
+
+                save_point_cloud_as_ply(merged_original_coords, merged_original_feats, original_file)
+                save_point_cloud_as_ply(merged_compress_coords, merged_compress_feats, compressed_file)
+                save_point_cloud_as_ply(merged_predicted_coords, merged_predicted_feats, result_file)
+
+                logger.info(f"已保存合并后的点云文件")
+                logger.info(f"合并后原始点云点数: {len(merged_original_coords)}")
+                logger.info(f"合并后压缩点云点数: {len(merged_compress_coords)}")
+                logger.info(f"合并后预测点云点数: {len(merged_predicted_coords)}")
+
+                # 计算PSNR
+                cmd1 = f"../../mpeg-pcc-tmc2/bin/PccAppMetrics --uncompressedDataPath={original_file} --reconstructedDataPath={compressed_file} --resolution=1023 --frameCount=1"
+                process1 = subprocess.Popen(cmd1, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                output1, error1 = process1.communicate()
+
+                psnr_file1 = f"{output_dir}/psnr_compressed_merged_batch_{batch_idx}.txt"
+                with open(psnr_file1, 'w') as f:
+                    f.write(output1.decode())
+                logger.info(f"压缩点云PSNR结果已保存到：{psnr_file1}")
+
+                cmd2 = f"../../mpeg-pcc-tmc2/bin/PccAppMetrics --uncompressedDataPath={original_file} --reconstructedDataPath={result_file} --resolution=1023 --frameCount=1"
+                process2 = subprocess.Popen(cmd2, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                output2, error2 = process2.communicate()
+
+                psnr_file2 = f"{output_dir}/psnr_result_merged_batch_{batch_idx}.txt"
+                with open(psnr_file2, 'w') as f:
+                    f.write(output2.decode())
+                logger.info(f"处理结果PSNR已保存到：{psnr_file2}")
 
     logger.info("\n开始评估...")
-    evaluate_and_save(model_path='epoch_10_model.pth',dataset=test_dataset)
+    evaluate_and_save(model_path='epoch_50_model.pth',dataset=test_dataset)
     logger.info("评估完成！请查看 output 文件夹中的结果")
     
