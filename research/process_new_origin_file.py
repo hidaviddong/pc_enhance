@@ -64,8 +64,6 @@ def load_and_match_ply(origin_path, compress_path):
     points_origin = np.asarray(pcd_origin.points)
     points_compress = np.asarray(pcd_compress.points)
     
-    # 转换为CPU点云并移除重复点
-
     unique_points_compress = np.unique(points_compress, axis=0)
     pcd_compress = o3d.cuda.pybind.geometry.PointCloud()
     pcd_compress.points = o3d.utility.Vector3dVector(unique_points_compress)
